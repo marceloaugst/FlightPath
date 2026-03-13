@@ -1,44 +1,28 @@
 import { Head } from "@inertiajs/react";
+import { memo } from "react";
 
-export default function Layout({ children, title }) {
+const Layout = memo(function Layout({ children, title }) {
     return (
         <>
             <Head>
-                <title>{title || "OpenSky Flight Tracker"}</title>
+                <title>{title || "SkyTracker - Flight Radar"}</title>
                 <meta
                     name="description"
                     content="Rastreador de voos em tempo real com dados da OpenSky Network"
                 />
+                <meta
+                    name="viewport"
+                    content="width=device-width, initial-scale=1.0"
+                />
+                <meta name="theme-color" content="#1e1b4b" />
             </Head>
 
-            <div className="min-h-screen bg-gray-50">
-                {/* Header */}
-                <header className="bg-white shadow-sm border-b">
-                    <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
-                        <div className="flex justify-between h-16">
-                            <div className="flex">
-                                <div className="flex-shrink-0 flex items-center">
-                                    <h1 className="text-xl font-bold text-gray-900">
-                                        ✈️ OpenSky Flight Tracker
-                                    </h1>
-                                </div>
-                            </div>
-                            <div className="flex items-center space-x-4">
-                                <span className="text-sm text-gray-500">
-                                    Dados em tempo real da OpenSky Network
-                                </span>
-                            </div>
-                        </div>
-                    </div>
-                </header>
-
-                {/* Main Content */}
-                <main className="py-6">
-                    <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
-                        {children}
-                    </div>
-                </main>
+            {/* Layout minimalista sem header */}
+            <div className="min-h-screen w-full overflow-x-hidden">
+                {children}
             </div>
         </>
     );
-}
+});
+
+export default Layout;

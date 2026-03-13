@@ -12,14 +12,123 @@
         "Noto Color Emoji";
 }
 
+/* Otimizações de performance */
+* {
+    /* Hardware acceleration para smoother animations */
+    transform: translateZ(0);
+    backface-visibility: hidden;
+    perspective: 1000px;
+}
+
 /* Leaflet Map Styles */
-/* Custom airplane icon styles */
 .custom-airplane-icon {
     background: none !important;
     border: none !important;
+    /* Otimização para renderização de ícones */
+    will-change: transform;
+    transform-style: preserve-3d;
 }
 
-/* Ensure leaflet controls are properly styled with tailwind */
 .leaflet-container {
     font-family: inherit;
+    /* Otimização para mapas */
+    contain: layout style size;
+}
+
+/* Popup moderno para o mapa */
+.leaflet-popup-content-wrapper {
+    background: none !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+    padding: 0 !important;
+}
+
+.leaflet-popup-content {
+    margin: 0 !important;
+    line-height: inherit !important;
+}
+
+.leaflet-popup-close-button {
+    display: none !important;
+}
+
+.leaflet-popup-tip {
+    background: rgba(15, 23, 42, 0.9) !important;
+    border: none !important;
+    box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25) !important;
+}
+
+/* Scrollbar customizado para a lista de voos */
+.custom-scrollbar::-webkit-scrollbar {
+    width: 8px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 4px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.3);
+    border-radius: 4px;
+    transition: background 0.2s ease;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.5);
+}
+
+/* Animações de loading suaves */
+@keyframes pulse-smooth {
+    0%,
+    100% {
+        opacity: 1;
+    }
+    50% {
+        opacity: 0.7;
+    }
+}
+
+.animate-pulse-smooth {
+    animation: pulse-smooth 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+/* Gradientes animados para efeito premium */
+@keyframes gradient-shift {
+    0% {
+        background-position: 0% 50%;
+    }
+    50% {
+        background-position: 100% 50%;
+    }
+    100% {
+        background-position: 0% 50%;
+    }
+}
+
+.animate-gradient {
+    background-size: 200% 200%;
+    animation: gradient-shift 8s ease infinite;
+}
+
+/* Performance: redução de re-paints */
+.performance-layer {
+    will-change: transform, opacity;
+    transform: translateZ(0);
+}
+
+/* Layout will not shift */
+.no-layout-shift {
+    contain: layout style;
+}
+
+/* Reduced motion para acessibilidade */
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+    }
 }
