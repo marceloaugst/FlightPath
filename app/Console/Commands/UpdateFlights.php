@@ -2,7 +2,7 @@
 
 namespace App\Console\Commands;
 
-use App\Services\OpenSkyService;
+use App\Jobs\UpdateFlightsJob;
 use Illuminate\Console\Command;
 
 class UpdateFlights extends Command
@@ -10,39 +10,43 @@ class UpdateFlights extends Command
     /**
      * O nome e a assinatura do comando.
      */
-    protected $signature = 'flights:update {--clean : Limpar voos antigos após atualização}';
+    protected $signature = 'flights:update {--force : Executar imediatamente} {--clean : Limpar cache antigo}';
 
     /**
      * A descrição do comando.
      */
-    protected $description = 'Atualiza dados de voos da API OpenSky Network';
+    protected $description = 'Dispatch job para atualizar dados de voos via WebSocket';
 
     /**
      * Execute o comando.
      */
-    public function handle(OpenSkyService $service)
+    public function handle()
     {
-        $this->info('🛫 Atualizando dados de voos da OpenSky Network...');
+        $this->info('🛫 Iniciando atualização de voos via WebSocket...');
 
         try {
-            // Atualiza os voos
-            $result = $service->updateFlights();
+            if ($this->option('force')) {
+                // Executa imediatamente
+                $this->info('⚡ Executando job imediatamente...');
+                UpdateFlightsJob::dispatchSync();
+                $this->info('✅ Job executado com sucesso!');
+            } else {
+                // Agenda para execução
+                UpdateFlightsJob::dispatch()->onQueue('flights');
+                $this->info('📝 Job agendado para execução na fila "flights"');
+            }
 
-            $this->info("✅ Atualização concluída:");
-            $this->line("   Total recebidos: {$result['total']}");
-            $this->line("   Novos voos: {$result['saved']}");
-            $this->line("   Voos atualizados: {$result['updated']}");
-
-            // Limpa voos antigos se solicitado
             if ($this->option('clean')) {
-                $this->info('🧹 Limpando voos antigos...');
-                $deleted = $service->cleanOldFlights();
-                $this->line("   Voos removidos: {$deleted}");
+                $this->info('🧹 Limpando cache antigo...');
+                cache()->forget('flights_data');
+                cache()->forget('flights_stats');
+                cache()->forget('flights_error');
+                $this->info('✅ Cache limpo!');
             }
 
             return Command::SUCCESS;
         } catch (\Exception $e) {
-            $this->error('❌ Erro ao atualizar voos: ' . $e->getMessage());
+            $this->error('❌ Erro ao processar comando: ' . $e->getMessage());
             return Command::FAILURE;
         }
     }

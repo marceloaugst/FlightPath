@@ -1,29 +1,120 @@
-import {
-    useState,
-    useEffect,
-    useMemo,
-    useCallback,
-    lazy,
-    Suspense,
-} from "react";
-import { router } from "@inertiajs/react";
+import { useState, useEffect, useMemo, useCallback, useRef, memo } from "react";
 import Layout from "../Layouts/Layout";
+import FlightMap from "../Components/FlightMap";
+import { useWebSocket } from "../hooks/useWebSocket";
 
-// Lazy load do FlightMap para melhor performance inicial
-const FlightMap = lazy(() => import("../Components/FlightMap"));
+// ─── Pure helpers (outside component → never re-created) ─────────────────────
+const metersToFeet = (m) => (m ? Math.round(m * 3.28084) : null);
+const msToKnots = (ms) => (ms ? Math.round(ms * 1.94384) : null);
 
-// Loading component para o map
-const MapLoading = () => (
-    <div className="h-[600px] flex items-center justify-center bg-gradient-to-br from-blue-50 to-indigo-100 rounded-3xl">
-        <div className="text-center space-y-4">
-            <div className="w-16 h-16 mx-auto relative">
-                <div className="absolute inset-0 rounded-full border-4 border-blue-200"></div>
-                <div className="absolute inset-0 rounded-full border-4 border-blue-500 border-t-transparent animate-spin"></div>
+// ─── Virtualization ───────────────────────────────────────────────────────────
+const ROW_HEIGHT = 28; // px — must match the row's rendered height
+
+function useVirtualList(items, containerRef, overscan = 8) {
+    const [scrollTop, setScrollTop] = useState(0);
+    const [containerHeight, setContainerHeight] = useState(600);
+
+    useEffect(() => {
+        const el = containerRef.current;
+        if (!el) return;
+
+        setContainerHeight(el.clientHeight);
+
+        const onScroll = () => setScrollTop(el.scrollTop);
+        el.addEventListener("scroll", onScroll, { passive: true });
+
+        const ro = new ResizeObserver(() =>
+            setContainerHeight(el.clientHeight),
+        );
+        ro.observe(el);
+
+        return () => {
+            el.removeEventListener("scroll", onScroll);
+            ro.disconnect();
+        };
+    }, [containerRef]);
+
+    return useMemo(() => {
+        const startIdx = Math.max(
+            0,
+            Math.floor(scrollTop / ROW_HEIGHT) - overscan,
+        );
+        const endIdx = Math.min(
+            items.length - 1,
+            Math.floor((scrollTop + containerHeight) / ROW_HEIGHT) + overscan,
+        );
+        return {
+            virtualItems: items.slice(startIdx, endIdx + 1).map((item, i) => ({
+                item,
+                index: startIdx + i,
+                offsetTop: (startIdx + i) * ROW_HEIGHT,
+            })),
+            totalHeight: items.length * ROW_HEIGHT,
+        };
+    }, [items, scrollTop, containerHeight, overscan]);
+}
+
+// ─── Debounce ─────────────────────────────────────────────────────────────────
+function useDebounce(value, delay) {
+    const [debounced, setDebounced] = useState(value);
+    useEffect(() => {
+        const t = setTimeout(() => setDebounced(value), delay);
+        return () => clearTimeout(t);
+    }, [value, delay]);
+    return debounced;
+}
+
+// ─── Memoised flight row ──────────────────────────────────────────────────────
+const FlightRow = memo(
+    function FlightRow({ flight, isSelected, onSelect, altFt, spdKt }) {
+        return (
+            <div
+                onClick={() => onSelect(flight)}
+                style={{ height: ROW_HEIGHT }}
+                className={`grid grid-cols-5 px-2 items-center cursor-pointer border-b border-slate-800 transition-colors text-xs ${
+                    isSelected
+                        ? "bg-sky-900/60 border-l-2 border-l-sky-400"
+                        : "hover:bg-slate-800/60"
+                }`}
+            >
+                <div className="col-span-2 flex items-center gap-1.5 min-w-0">
+                    <span className="font-medium text-slate-100 truncate">
+                        {flight.callsign?.trim() || flight.icao24}
+                    </span>
+                </div>
+                <span className="text-right text-slate-300 tabular-nums">
+                    {altFt != null ? altFt.toLocaleString() : "—"}
+                </span>
+                <span className="text-right text-slate-300 tabular-nums">
+                    {spdKt != null
+                        ? spdKt
+                        : flight.speed_kmh
+                          ? Math.round(flight.speed_kmh / 1.852)
+                          : "—"}
+                </span>
+                <span
+                    className={`text-right tabular-nums ${flight.on_ground ? "text-slate-500" : "text-green-400"}`}
+                >
+                    {flight.on_ground ? "GND" : "—"}
+                </span>
             </div>
-            <p className="text-gray-600 font-medium">Carregando mapa...</p>
-        </div>
-    </div>
+        );
+    },
+    (prev, next) =>
+        prev.isSelected === next.isSelected &&
+        prev.altFt === next.altFt &&
+        prev.spdKt === next.spdKt &&
+        prev.flight.callsign === next.flight.callsign,
 );
+
+// Columns visible in the flight table
+const COLUMNS = [
+    { key: "callsign", label: "Callsign" },
+    { key: "origin_country", label: "Country" },
+    { key: "baro_altitude", label: "Alt (ft)" },
+    { key: "speed_kmh", label: "Spd (kt)" },
+    { key: "on_ground", label: "Status" },
+];
 
 export default function Dashboard({
     flights: initialFlights = [],
@@ -32,550 +123,402 @@ export default function Dashboard({
     cache_duration = 30,
     error = null,
 }) {
-    const [flights, setFlights] = useState(initialFlights);
-    const [stats, setStats] = useState(initialStats);
+    const {
+        flights,
+        stats,
+        connectionStatus,
+        lastUpdate,
+        error: wsError,
+        triggerUpdate,
+    } = useWebSocket(initialFlights, initialStats);
+
     const [isRefreshing, setIsRefreshing] = useState(false);
-    const [lastUpdate, setLastUpdate] = useState(new Date());
-    const [autoRefresh, setAutoRefresh] = useState(true);
-    const [errorMessage, setErrorMessage] = useState(error);
-    const [connectionStatus, setConnectionStatus] = useState("connected");
+    const [autoRefresh, setAutoRefresh] = useState(realtime);
+    const [errorMessage, setErrorMessage] = useState(error || wsError);
+    const [searchQuery, setSearchQuery] = useState("");
+    const [selectedFlight, setSelectedFlight] = useState(null);
+    const [activeTab, setActiveTab] = useState("search");
+    const [showSidebar, setShowSidebar] = useState(true);
 
-    // Otimização: debounce para refresh
-    const [refreshTimeout, setRefreshTimeout] = useState(null);
+    // Ref for virtualised list container
+    const listContainerRef = useRef(null);
 
-    // Função para buscar novos dados em tempo real (memoizada)
-    const refreshFlights = useCallback(async (silent = false) => {
-        if (!silent) setIsRefreshing(true);
-        setErrorMessage(null);
+    // Debounce search so filteredFlights only recomputes 200ms after user stops typing
+    const debouncedSearch = useDebounce(searchQuery, 200);
 
-        try {
-            const response = await fetch("/api/dashboard/refresh", {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                    "X-CSRF-TOKEN":
-                        document
-                            .querySelector('meta[name="csrf-token"]')
-                            ?.getAttribute("content") || "",
-                },
-            });
-
-            const data = await response.json();
-
-            if (data.success) {
-                setFlights(data.flights || []);
-                setStats(data.stats || {});
-                setLastUpdate(new Date());
-                setConnectionStatus("connected");
-            } else {
-                throw new Error(data.message || "Erro desconhecido");
-            }
-        } catch (error) {
-            console.error("Erro ao atualizar voos:", error);
-            setErrorMessage(error.message);
-            setConnectionStatus("error");
-        } finally {
-            if (!silent) setIsRefreshing(false);
-        }
-    }, []);
-
-    // Otimização: função de test connection memoizada
-    const testConnection = useCallback(async () => {
-        try {
-            const response = await fetch("/api/realtime/test");
-            const data = await response.json();
-            setConnectionStatus(data.success ? "connected" : "error");
-        } catch {
-            setConnectionStatus("error");
-        }
-    }, []);
-
-    // Auto refresh otimizado com debounce
     useEffect(() => {
-        let interval;
+        setErrorMessage(error || wsError);
+    }, [error, wsError]);
 
-        if (autoRefresh && realtime) {
-            interval = setInterval(() => {
-                refreshFlights(true); // Silent refresh
-            }, cache_duration * 1000);
-        }
-
-        return () => {
-            if (interval) {
-                clearInterval(interval);
+    const refreshFlights = useCallback(
+        async (silent = false) => {
+            if (!silent) setIsRefreshing(true);
+            try {
+                await triggerUpdate();
+                setErrorMessage(null);
+            } catch (err) {
+                setErrorMessage(err.message);
+            } finally {
+                if (!silent) setIsRefreshing(false);
             }
-        };
+        },
+        [triggerUpdate],
+    );
+
+    useEffect(() => {
+        if (!autoRefresh || !realtime) return;
+        const interval = setInterval(
+            () => refreshFlights(true),
+            Math.max(cache_duration * 1000, 30000),
+        );
+        return () => clearInterval(interval);
     }, [autoRefresh, realtime, cache_duration, refreshFlights]);
 
-    // Test connection on mount (otimizado)
-    useEffect(() => {
-        if (realtime) {
-            testConnection();
-        }
-    }, [realtime, testConnection]);
-
-    // Formatação memoizada do último update
     const formatLastUpdate = useMemo(() => {
         const diffMs = Date.now() - lastUpdate.getTime();
         const diffSeconds = Math.floor(diffMs / 1000);
-
-        if (diffSeconds < 60) return `${diffSeconds}s atrás`;
-        if (diffSeconds < 3600)
-            return `${Math.floor(diffSeconds / 60)}min atrás`;
-        return lastUpdate.toLocaleTimeString("pt-BR");
+        if (diffSeconds < 60) return `${diffSeconds}s ago`;
+        if (diffSeconds < 3600) return `${Math.floor(diffSeconds / 60)}m ago`;
+        return lastUpdate.toLocaleTimeString();
     }, [lastUpdate]);
 
-    // Status styles memoizados
-    const statusConfig = useMemo(
-        () => ({
-            connected: {
-                color: "bg-green-500",
-                text: "Conectado",
-                glow: "shadow-green-500/20",
-            },
-            error: {
-                color: "bg-red-500",
-                text: "Erro de conexão",
-                glow: "shadow-red-500/20",
-            },
-            refreshing: {
-                color: "bg-yellow-500",
-                text: "Atualizando...",
-                glow: "shadow-yellow-500/20",
-            },
-        }),
+    // Filtered list uses DEBOUNCED query — avoids recomputing on every keystroke
+    const filteredFlights = useMemo(() => {
+        if (!debouncedSearch.trim()) return flights;
+        const q = debouncedSearch.trim().toLowerCase();
+        return flights.filter(
+            (f) =>
+                f.callsign?.toLowerCase().includes(q) ||
+                f.origin_country?.toLowerCase().includes(q) ||
+                f.icao24?.toLowerCase().includes(q),
+        );
+    }, [flights, debouncedSearch]);
+
+    // Virtualised window over filteredFlights
+    const { virtualItems, totalHeight } = useVirtualList(
+        filteredFlights,
+        listContainerRef,
+    );
+
+    const handleSelectFlight = useCallback(
+        (flight) =>
+            setSelectedFlight((prev) =>
+                prev?.icao24 === flight.icao24 ? null : flight,
+            ),
         [],
     );
 
-    // Toggle auto-refresh otimizado
-    const handleAutoRefreshToggle = useCallback((checked) => {
-        setAutoRefresh(checked);
-    }, []);
-
-    // Manual refresh otimizado
-    const handleManualRefresh = useCallback(() => {
-        if (!isRefreshing) {
-            refreshFlights();
-        }
-    }, [isRefreshing, refreshFlights]);
-
     return (
-        <Layout title="Flight Tracker - Tempo Real">
-            {/* Background moderno com gradiente */}
-            <div className="min-h-screen bg-gradient-to-br from-indigo-900 via-purple-900 to-pink-900 relative overflow-hidden">
-                {/* Elementos decorativos de fundo */}
-                <div className="absolute inset-0 overflow-hidden">
-                    <div className="absolute -top-4 -right-4 w-72 h-72 bg-blue-500 rounded-full opacity-20 blur-3xl"></div>
-                    <div className="absolute top-1/3 -left-8 w-96 h-96 bg-purple-500 rounded-full opacity-15 blur-3xl"></div>
-                    <div className="absolute bottom-10 right-1/4 w-80 h-80 bg-pink-500 rounded-full opacity-10 blur-3xl"></div>
-                </div>
+        <Layout title="FlightPath — Live Flight Map">
+            {/* Full-screen dark layout */}
+            <div className="flex flex-col h-screen bg-slate-900 text-slate-100 overflow-hidden">
+                {/* ── Top bar ── */}
+                <header className="flex items-center justify-between px-4 py-2 bg-slate-950 border-b border-slate-700 shrink-0 z-10">
+                    {/* Brand */}
+                    <div className="flex items-center gap-3">
+                        <div className="flex items-center gap-1.5">
+                            <svg
+                                className="w-5 h-5 text-sky-400"
+                                viewBox="0 0 24 24"
+                                fill="currentColor"
+                            >
+                                <path d="M21 16v-2l-8-5V3.5A1.5 1.5 0 0011.5 2 1.5 1.5 0 0010 3.5V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5z" />
+                            </svg>
+                            <span className="font-bold text-sky-400 tracking-widest text-sm uppercase">
+                                FlightPath
+                            </span>
+                        </div>
+                        <span className="hidden sm:block text-slate-500 text-xs">
+                            Live Flight Map
+                        </span>
+                    </div>
 
-                <div className="relative z-10 space-y-8 p-6">
-                    {/* Header Hero Section */}
-                    <div className="text-center space-y-6 py-12">
-                        <div className="space-y-4">
-                            <h1 className="text-6xl md:text-7xl font-black text-transparent bg-clip-text bg-gradient-to-r from-white via-blue-200 to-purple-200">
-                                SkyTracker
-                            </h1>
-                            <div className="flex items-center justify-center space-x-3">
-                                <div
-                                    className={`w-4 h-4 rounded-full ${statusConfig[connectionStatus]?.color} animate-pulse shadow-lg ${statusConfig[connectionStatus]?.glow}`}
-                                ></div>
-                                <span className="text-white/80 font-medium">
-                                    {statusConfig[connectionStatus]?.text}
+                    {/* Center — counters */}
+                    <div className="flex items-center gap-6 text-xs text-slate-400">
+                        <div className="text-center">
+                            <span className="block text-slate-100 font-semibold text-base leading-none">
+                                {stats.total || 0}
+                            </span>
+                            <span>Total Aircraft</span>
+                        </div>
+                        <div className="text-center hidden sm:block">
+                            <span className="block text-green-400 font-semibold text-base leading-none">
+                                {stats.airborne || 0}
+                            </span>
+                            <span>Airborne</span>
+                        </div>
+                        <div className="text-center hidden md:block">
+                            <span className="block text-sky-400 font-semibold text-base leading-none">
+                                {stats.with_position || 0}
+                            </span>
+                            <span>On Screen</span>
+                        </div>
+                        <div className="text-center hidden md:block">
+                            <span className="block text-purple-400 font-semibold text-base leading-none">
+                                {stats.countries || 0}
+                            </span>
+                            <span>Countries</span>
+                        </div>
+                    </div>
+
+                    {/* Right — status & controls */}
+                    <div className="flex items-center gap-3">
+                        {errorMessage && (
+                            <span className="text-red-400 text-xs hidden sm:block">
+                                {errorMessage}
+                            </span>
+                        )}
+
+                        {/* Live indicator */}
+                        <div className="flex items-center gap-1.5 text-xs">
+                            <div
+                                className={`w-2 h-2 rounded-full ${
+                                    connectionStatus === "connected"
+                                        ? "bg-green-400 animate-pulse"
+                                        : connectionStatus === "connecting"
+                                          ? "bg-yellow-400 animate-pulse"
+                                          : "bg-red-500"
+                                }`}
+                            />
+                            <span className="hidden sm:block text-slate-400">
+                                {connectionStatus === "connected"
+                                    ? `Live · ${formatLastUpdate}`
+                                    : connectionStatus}
+                            </span>
+                        </div>
+
+                        <label className="flex items-center gap-1.5 cursor-pointer text-xs text-slate-400">
+                            <input
+                                type="checkbox"
+                                checked={autoRefresh}
+                                onChange={(e) =>
+                                    setAutoRefresh(e.target.checked)
+                                }
+                                className="accent-sky-500 w-3 h-3"
+                            />
+                            Auto
+                        </label>
+
+                        <button
+                            onClick={() => refreshFlights()}
+                            disabled={isRefreshing}
+                            className="bg-sky-600 hover:bg-sky-500 disabled:opacity-40 text-white text-xs px-3 py-1.5 rounded transition-colors font-medium"
+                        >
+                            {isRefreshing ? "..." : "Refresh"}
+                        </button>
+
+                        <button
+                            onClick={() => setShowSidebar((v) => !v)}
+                            className="text-slate-400 hover:text-slate-200 transition-colors text-xs px-1.5 py-1.5 rounded border border-slate-700"
+                            title="Toggle panel"
+                        >
+                            {showSidebar ? "▶" : "◀"}
+                        </button>
+                    </div>
+                </header>
+
+                {/* ── Body: map + right panel ── */}
+                <div className="flex flex-1 min-h-0">
+                    {/* Map — fills remaining space */}
+                    <div className="flex-1 relative min-w-0">
+                        <FlightMap
+                            flights={flights}
+                            refreshing={isRefreshing}
+                            realtime={realtime}
+                            selectedFlight={selectedFlight}
+                            onSelectFlight={handleSelectFlight}
+                        />
+                    </div>
+
+                    {/* ── Right panel ── */}
+                    {showSidebar && (
+                        <aside className="w-72 bg-slate-950 border-l border-slate-700 flex flex-col shrink-0 overflow-hidden">
+                            {/* Tab bar */}
+                            <div className="flex border-b border-slate-700 shrink-0">
+                                {["search", "filters", "columns"].map((tab) => (
+                                    <button
+                                        key={tab}
+                                        onClick={() => setActiveTab(tab)}
+                                        className={`flex-1 py-2 text-xs font-medium capitalize tracking-wide transition-colors ${
+                                            activeTab === tab
+                                                ? "text-sky-400 border-b-2 border-sky-400 bg-slate-900"
+                                                : "text-slate-400 hover:text-slate-200"
+                                        }`}
+                                    >
+                                        {tab}
+                                    </button>
+                                ))}
+                            </div>
+
+                            {/* Search tab */}
+                            {activeTab === "search" && (
+                                <div className="px-3 py-2 border-b border-slate-700 shrink-0">
+                                    <div className="flex gap-2">
+                                        <input
+                                            type="text"
+                                            placeholder="Callsign, country, ICAO…"
+                                            value={searchQuery}
+                                            onChange={(e) =>
+                                                setSearchQuery(e.target.value)
+                                            }
+                                            className="flex-1 bg-slate-800 border border-slate-600 text-slate-100 text-xs px-2 py-1.5 rounded placeholder-slate-500 focus:outline-none focus:border-sky-500"
+                                        />
+                                        {searchQuery && (
+                                            <button
+                                                onClick={() =>
+                                                    setSearchQuery("")
+                                                }
+                                                className="text-slate-500 hover:text-slate-200 px-1 text-xs"
+                                            >
+                                                ✕
+                                            </button>
+                                        )}
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Filters tab */}
+                            {activeTab === "filters" && (
+                                <div className="px-3 py-3 border-b border-slate-700 shrink-0 space-y-2">
+                                    <p className="text-xs text-slate-500">
+                                        Filter by status
+                                    </p>
+                                    <div className="flex gap-2">
+                                        <span className="text-xs bg-slate-800 border border-slate-600 px-2 py-1 rounded text-slate-300">
+                                            All
+                                        </span>
+                                        <span className="text-xs bg-slate-800 border border-slate-600 px-2 py-1 rounded text-green-400">
+                                            Airborne
+                                        </span>
+                                        <span className="text-xs bg-slate-800 border border-slate-600 px-2 py-1 rounded text-slate-400">
+                                            Ground
+                                        </span>
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Columns tab */}
+                            {activeTab === "columns" && (
+                                <div className="px-3 py-3 border-b border-slate-700 shrink-0 space-y-1.5">
+                                    <p className="text-xs text-slate-500 mb-2">
+                                        Visible columns
+                                    </p>
+                                    {COLUMNS.map((col) => (
+                                        <label
+                                            key={col.key}
+                                            className="flex items-center gap-2 cursor-pointer"
+                                        >
+                                            <input
+                                                type="checkbox"
+                                                defaultChecked
+                                                className="accent-sky-500 w-3 h-3"
+                                            />
+                                            <span className="text-xs text-slate-300">
+                                                {col.label}
+                                            </span>
+                                        </label>
+                                    ))}
+                                </div>
+                            )}
+
+                            {/* Table header */}
+                            <div className="grid grid-cols-5 px-2 py-1.5 bg-slate-800 border-b border-slate-700 shrink-0">
+                                <span className="text-xs font-semibold text-slate-400 uppercase tracking-wide col-span-2">
+                                    Callsign
                                 </span>
-                                {realtime && (
-                                    <span className="bg-red-500/20 text-red-300 px-3 py-1 rounded-full text-sm border border-red-500/30">
-                                        🔴 AO VIVO
-                                    </span>
+                                <span className="text-xs font-semibold text-slate-400 uppercase tracking-wide text-right">
+                                    Alt
+                                </span>
+                                <span className="text-xs font-semibold text-slate-400 uppercase tracking-wide text-right">
+                                    Spd
+                                </span>
+                                <span className="text-xs font-semibold text-slate-400 uppercase tracking-wide text-right">
+                                    RSSI
+                                </span>
+                            </div>
+
+                            {/* Flight rows — virtualised */}
+                            <div
+                                ref={listContainerRef}
+                                className="flex-1 overflow-y-auto"
+                            >
+                                {filteredFlights.length === 0 ? (
+                                    <div className="flex flex-col items-center justify-center h-32 text-slate-500 text-sm">
+                                        <svg
+                                            className="w-8 h-8 mb-2 opacity-40"
+                                            fill="none"
+                                            stroke="currentColor"
+                                            viewBox="0 0 24 24"
+                                        >
+                                            <path
+                                                strokeLinecap="round"
+                                                strokeLinejoin="round"
+                                                strokeWidth={1.5}
+                                                d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"
+                                            />
+                                        </svg>
+                                        {searchQuery
+                                            ? "No results"
+                                            : "No flights loaded"}
+                                    </div>
+                                ) : (
+                                    /* Outer div holds the full scrollable height */
+                                    <div
+                                        style={{
+                                            height: totalHeight,
+                                            position: "relative",
+                                        }}
+                                    >
+                                        {virtualItems.map(
+                                            ({
+                                                item: flight,
+                                                index,
+                                                offsetTop,
+                                            }) => {
+                                                const isSelected =
+                                                    selectedFlight?.icao24 ===
+                                                    flight.icao24;
+                                                const altFt = metersToFeet(
+                                                    flight.baro_altitude,
+                                                );
+                                                const spdKt = msToKnots(
+                                                    flight.velocity,
+                                                );
+                                                return (
+                                                    <div
+                                                        key={`${flight.icao24}-${index}`}
+                                                        style={{
+                                                            position:
+                                                                "absolute",
+                                                            top: offsetTop,
+                                                            width: "100%",
+                                                        }}
+                                                    >
+                                                        <FlightRow
+                                                            flight={flight}
+                                                            isSelected={
+                                                                isSelected
+                                                            }
+                                                            onSelect={
+                                                                handleSelectFlight
+                                                            }
+                                                            altFt={altFt}
+                                                            spdKt={spdKt}
+                                                        />
+                                                    </div>
+                                                );
+                                            },
+                                        )}
+                                    </div>
                                 )}
                             </div>
-                            <p className="text-white/70 text-lg max-w-2xl mx-auto">
-                                Acompanhe voos em tempo real ao redor do mundo
-                                com dados da OpenSky Network
-                            </p>
-                        </div>
 
-                        {/* Controls modernos */}
-                        <div className="flex flex-col sm:flex-row items-center justify-center space-y-4 sm:space-y-0 sm:space-x-6">
-                            {errorMessage && (
-                                <div className="bg-red-500/20 border border-red-500/30 backdrop-blur-md text-red-200 px-4 py-2 rounded-xl text-sm">
-                                    {errorMessage}
-                                </div>
-                            )}
-
-                            <label className="flex items-center space-x-3 bg-white/10 backdrop-blur-md px-4 py-2 rounded-xl border border-white/20 cursor-pointer hover:bg-white/20 transition-all">
-                                <input
-                                    type="checkbox"
-                                    checked={autoRefresh}
-                                    onChange={(e) =>
-                                        handleAutoRefreshToggle(
-                                            e.target.checked,
-                                        )
-                                    }
-                                    className="w-4 h-4 rounded border-white/30 bg-white/20 text-blue-500 focus:ring-2 focus:ring-blue-500/50"
-                                />
-                                <span className="text-white font-medium">
-                                    Auto-refresh
-                                </span>
-                            </label>
-
-                            <button
-                                onClick={handleManualRefresh}
-                                disabled={isRefreshing}
-                                className="group bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700
-                                    disabled:opacity-50 disabled:cursor-not-allowed text-white px-6 py-3 rounded-xl font-semibold
-                                    transition-all duration-300 flex items-center space-x-3 shadow-lg hover:shadow-xl
-                                    hover:scale-105 disabled:hover:scale-100"
-                            >
-                                <svg
-                                    className={`w-5 h-5 transition-transform duration-300 ${isRefreshing ? "animate-spin" : "group-hover:rotate-180"}`}
-                                    fill="none"
-                                    stroke="currentColor"
-                                    viewBox="0 0 24 24"
-                                >
-                                    <path
-                                        strokeLinecap="round"
-                                        strokeLinejoin="round"
-                                        strokeWidth={2}
-                                        d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
-                                    />
-                                </svg>
-                                <span>
-                                    {isRefreshing
-                                        ? "Atualizando..."
-                                        : "Atualizar"}
-                                </span>
-                            </button>
-                        </div>
-
-                        <div className="text-white/60 text-sm">
-                            Última atualização: {formatLastUpdate}
-                            {realtime && (
-                                <span className="ml-2">
-                                    • Cache: {cache_duration}s
-                                </span>
-                            )}
-                        </div>
-                    </div>
-
-                    {/* Estatísticas modernas em layout assimétrico */}
-                    <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-6">
-                        {/* Total Flights - Card principal maior */}
-                        <div className="md:col-span-2 xl:col-span-1">
-                            <div
-                                className="group relative bg-gradient-to-br from-blue-500/20 to-cyan-500/20
-                                backdrop-blur-xl border border-white/20 rounded-2xl p-6
-                                hover:from-blue-500/30 hover:to-cyan-500/30 transition-all duration-500
-                                hover:scale-105 cursor-pointer"
-                            >
-                                <div className="absolute inset-0 bg-gradient-to-br from-blue-500/10 to-transparent rounded-2xl opacity-0 group-hover:opacity-100 transition-opacity duration-500"></div>
-                                <div className="relative z-10">
-                                    <div className="flex items-center justify-between mb-4">
-                                        <div className="p-3 bg-blue-500/30 rounded-xl backdrop-blur-sm">
-                                            <svg
-                                                className="w-8 h-8 text-white"
-                                                fill="none"
-                                                stroke="currentColor"
-                                                viewBox="0 0 24 24"
-                                            >
-                                                <path
-                                                    strokeLinecap="round"
-                                                    strokeLinejoin="round"
-                                                    strokeWidth={2}
-                                                    d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"
-                                                />
-                                            </svg>
-                                        </div>
-                                        <div className="text-right">
-                                            <div className="text-4xl font-black text-white tracking-tight">
-                                                {stats.total?.toLocaleString() ||
-                                                    0}
-                                            </div>
-                                            <div className="text-white/70 text-sm font-medium">
-                                                Total de Voos
-                                            </div>
-                                        </div>
-                                    </div>
-                                    <div className="w-full bg-white/10 rounded-full h-2">
-                                        <div
-                                            className="bg-gradient-to-r from-blue-400 to-cyan-400 h-2 rounded-full transition-all duration-1000"
-                                            style={{
-                                                width: `${Math.min(100, (stats.total || 0) / 50)}%`,
-                                            }}
-                                        ></div>
-                                    </div>
-                                </div>
+                            {/* Panel footer */}
+                            <div className="px-3 py-2 border-t border-slate-700 shrink-0 flex items-center justify-between text-xs text-slate-500">
+                                <span>{filteredFlights.length} aircraft</span>
+                                <span>{formatLastUpdate}</span>
                             </div>
-                        </div>
-
-                        {/* Com Posição */}
-                        <div
-                            className="group relative bg-gradient-to-br from-emerald-500/20 to-teal-500/20
-                            backdrop-blur-xl border border-white/20 rounded-2xl p-6
-                            hover:from-emerald-500/30 hover:to-teal-500/30 transition-all duration-500 hover:scale-105"
-                        >
-                            <div className="flex items-center space-x-4">
-                                <div className="p-3 bg-emerald-500/30 rounded-xl">
-                                    <svg
-                                        className="w-6 h-6 text-white"
-                                        fill="none"
-                                        stroke="currentColor"
-                                        viewBox="0 0 24 24"
-                                    >
-                                        <path
-                                            strokeLinecap="round"
-                                            strokeLinejoin="round"
-                                            strokeWidth={2}
-                                            d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"
-                                        />
-                                        <path
-                                            strokeLinecap="round"
-                                            strokeLinejoin="round"
-                                            strokeWidth={2}
-                                            d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"
-                                        />
-                                    </svg>
-                                </div>
-                                <div>
-                                    <div className="text-3xl font-bold text-white">
-                                        {stats.with_position?.toLocaleString() ||
-                                            0}
-                                    </div>
-                                    <div className="text-white/70 text-sm">
-                                        Geolocalizados
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-
-                        {/* Países */}
-                        <div
-                            className="group relative bg-gradient-to-br from-violet-500/20 to-purple-500/20
-                            backdrop-blur-xl border border-white/20 rounded-2xl p-6
-                            hover:from-violet-500/30 hover:to-purple-500/30 transition-all duration-500 hover:scale-105"
-                        >
-                            <div className="flex items-center space-x-4">
-                                <div className="p-3 bg-violet-500/30 rounded-xl">
-                                    <svg
-                                        className="w-6 h-6 text-white"
-                                        fill="none"
-                                        stroke="currentColor"
-                                        viewBox="0 0 24 24"
-                                    >
-                                        <path
-                                            strokeLinecap="round"
-                                            strokeLinejoin="round"
-                                            strokeWidth={2}
-                                            d="M3.055 11H5a2 2 0 012 2v1a2 2 0 002 2 2 2 0 012 2v2.945M8 3.935V5.5A2.5 2.5 0 0010.5 8h.5a2 2 0 012 2 2 2 0 104 0 2 2 0 012-2h1.064M15 20.488V18a2 2 0 012-2h3.064M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
-                                        />
-                                    </svg>
-                                </div>
-                                <div>
-                                    <div className="text-3xl font-bold text-white">
-                                        {stats.countries?.toLocaleString() || 0}
-                                    </div>
-                                    <div className="text-white/70 text-sm">
-                                        Países
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-
-                        {/* Voando */}
-                        <div
-                            className="group relative bg-gradient-to-br from-orange-500/20 to-red-500/20
-                            backdrop-blur-xl border border-white/20 rounded-2xl p-6
-                            hover:from-orange-500/30 hover:to-red-500/30 transition-all duration-500 hover:scale-105"
-                        >
-                            <div className="flex items-center space-x-4">
-                                <div className="p-3 bg-orange-500/30 rounded-xl relative">
-                                    <svg
-                                        className="w-6 h-6 text-white"
-                                        fill="none"
-                                        stroke="currentColor"
-                                        viewBox="0 0 24 24"
-                                    >
-                                        <path
-                                            strokeLinecap="round"
-                                            strokeLinejoin="round"
-                                            strokeWidth={2}
-                                            d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"
-                                        />
-                                    </svg>
-                                    <div className="absolute -top-1 -right-1 w-3 h-3 bg-green-400 rounded-full animate-pulse"></div>
-                                </div>
-                                <div>
-                                    <div className="text-3xl font-bold text-white">
-                                        {stats.airborne?.toLocaleString() || 0}
-                                    </div>
-                                    <div className="text-white/70 text-sm">
-                                        Em Voo
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-
-                    {/* Mapa principal */}
-                    <div
-                        className="bg-white/10 backdrop-blur-xl border border-white/20 rounded-3xl p-6
-                        shadow-2xl hover:bg-white/15 transition-all duration-500"
-                    >
-                        <div className="flex justify-between items-center mb-6">
-                            <div>
-                                <h3 className="text-2xl font-bold text-white mb-2">
-                                    Mapa Global {realtime ? "• Tempo Real" : ""}
-                                </h3>
-                                <p className="text-white/70">
-                                    {realtime
-                                        ? "Dados da OpenSky Network com autenticação"
-                                        : "Visualização de dados locais"}
-                                </p>
-                            </div>
-                            {realtime && (
-                                <div className="flex items-center space-x-2 bg-green-500/20 px-4 py-2 rounded-xl border border-green-500/30">
-                                    <div className="w-2 h-2 bg-green-400 rounded-full animate-pulse"></div>
-                                    <span className="text-green-300 text-sm font-medium">
-                                        API Ativa
-                                    </span>
-                                </div>
-                            )}
-                        </div>
-
-                        <Suspense fallback={<MapLoading />}>
-                            <FlightMap
-                                flights={flights}
-                                refreshing={isRefreshing}
-                                realtime={realtime}
-                            />
-                        </Suspense>
-                    </div>
-
-                    {/* Lista de voos moderna e otimizada */}
-                    {flights.length > 0 && (
-                        <div className="bg-white/10 backdrop-blur-xl border border-white/20 rounded-3xl overflow-hidden shadow-lg">
-                            <div className="px-8 py-6 border-b border-white/20 bg-gradient-to-r from-white/5 to-transparent">
-                                <div className="flex justify-between items-center">
-                                    <h3 className="text-xl font-bold text-white flex items-center space-x-3">
-                                        <div className="w-8 h-8 bg-gradient-to-r from-blue-500 to-purple-600 rounded-lg flex items-center justify-center">
-                                            <svg
-                                                className="w-5 h-5 text-white"
-                                                fill="none"
-                                                stroke="currentColor"
-                                                viewBox="0 0 24 24"
-                                            >
-                                                <path
-                                                    strokeLinecap="round"
-                                                    strokeLinejoin="round"
-                                                    strokeWidth={2}
-                                                    d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"
-                                                />
-                                            </svg>
-                                        </div>
-                                        <span>
-                                            Voos Ativos ({flights.length})
-                                        </span>
-                                    </h3>
-                                    <span className="text-white/60 text-sm bg-white/10 px-3 py-1 rounded-lg">
-                                        Primeiros 20 resultados
-                                    </span>
-                                </div>
-                            </div>
-
-                            <div className="max-h-96 overflow-y-auto custom-scrollbar">
-                                <div className="overflow-x-auto">
-                                    <table className="min-w-full">
-                                        <thead className="bg-white/5 sticky top-0 backdrop-blur-sm">
-                                            <tr>
-                                                {[
-                                                    "Callsign",
-                                                    "País",
-                                                    "Altitude",
-                                                    "Velocidade",
-                                                    "Status",
-                                                    "Último Contato",
-                                                ].map((header) => (
-                                                    <th
-                                                        key={header}
-                                                        className="px-6 py-4 text-left text-xs font-semibold text-white/80 uppercase tracking-wider"
-                                                    >
-                                                        {header}
-                                                    </th>
-                                                ))}
-                                            </tr>
-                                        </thead>
-                                        <tbody className="divide-y divide-white/10">
-                                            {flights
-                                                .slice(0, 20)
-                                                .map((flight, index) => (
-                                                    <tr
-                                                        key={`${flight.icao24}-${index}`}
-                                                        className="hover:bg-white/10 transition-colors duration-200 group"
-                                                    >
-                                                        <td className="px-6 py-4 whitespace-nowrap">
-                                                            <div className="flex items-center space-x-3">
-                                                                <div className="text-lg">
-                                                                    {flight.on_ground
-                                                                        ? "🛬"
-                                                                        : "✈️"}
-                                                                </div>
-                                                                <div>
-                                                                    <div className="text-sm font-semibold text-white">
-                                                                        {flight.callsign?.trim() ||
-                                                                            "Anônimo"}
-                                                                    </div>
-                                                                    <div className="text-xs text-white/60 font-mono">
-                                                                        {
-                                                                            flight.icao24
-                                                                        }
-                                                                    </div>
-                                                                </div>
-                                                            </div>
-                                                        </td>
-                                                        <td className="px-6 py-4 whitespace-nowrap text-sm text-white/80">
-                                                            {flight.origin_country ||
-                                                                "N/A"}
-                                                        </td>
-                                                        <td className="px-6 py-4 whitespace-nowrap text-sm text-white/80">
-                                                            {flight.baro_altitude
-                                                                ? `${Math.round(flight.baro_altitude).toLocaleString()}m`
-                                                                : "N/A"}
-                                                        </td>
-                                                        <td className="px-6 py-4 whitespace-nowrap text-sm text-white/80">
-                                                            {flight.speed_kmh
-                                                                ? `${flight.speed_kmh}km/h`
-                                                                : "N/A"}
-                                                        </td>
-                                                        <td className="px-6 py-4 whitespace-nowrap">
-                                                            <span
-                                                                className={`inline-flex px-3 py-1 text-xs font-semibold rounded-full ${
-                                                                    flight.on_ground
-                                                                        ? "bg-gray-500/20 text-gray-300 border border-gray-500/30"
-                                                                        : "bg-green-500/20 text-green-300 border border-green-500/30"
-                                                                }`}
-                                                            >
-                                                                {flight.on_ground
-                                                                    ? "Solo"
-                                                                    : "Voando"}
-                                                            </span>
-                                                        </td>
-                                                        <td className="px-6 py-4 whitespace-nowrap text-sm text-white/80">
-                                                            {flight.last_contact
-                                                                ? new Date(
-                                                                      flight.last_contact,
-                                                                  ).toLocaleTimeString(
-                                                                      "pt-BR",
-                                                                  )
-                                                                : "N/A"}
-                                                        </td>
-                                                    </tr>
-                                                ))}
-                                        </tbody>
-                                    </table>
-                                </div>
-                            </div>
-                        </div>
+                        </aside>
                     )}
                 </div>
             </div>

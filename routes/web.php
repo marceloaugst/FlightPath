@@ -23,6 +23,23 @@ Route::prefix('api/realtime')->name('api.realtime.')->group(function () {
 // API endpoint para dashboard refresh
 Route::post('/api/dashboard/refresh', [DashboardController::class, 'refresh'])->name('api.dashboard.refresh');
 
+// WebSocket API endpoints
+Route::prefix('api/websocket')->name('api.websocket.')->group(function () {
+    Route::post('/update-flights', function () {
+        \App\Jobs\UpdateFlightsJob::dispatch()->onQueue('flights');
+        return response()->json(['status' => 'dispatched', 'timestamp' => now()]);
+    })->name('update-flights');
+
+    Route::get('/status', function () {
+        return response()->json([
+            'websocket_active' => true,
+            'last_update' => cache('flights_last_update'),
+            'flights_count' => count(cache('flights_data', [])),
+            'redis_connected' => cache()->getStore() instanceof \Illuminate\Cache\RedisStore
+        ]);
+    })->name('status');
+});
+
 // API endpoints legados (banco de dados)
 Route::prefix('api')->name('api.')->group(function () {
     Route::get('/flights', [FlightController::class, 'index'])->name('flights');

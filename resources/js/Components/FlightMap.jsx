@@ -1,9 +1,8 @@
-import { useEffect, useState, useMemo, useCallback, memo } from "react";
+import { useEffect, useMemo, useCallback, useRef, memo } from "react";
 import { MapContainer, TileLayer, Marker, Popup, useMap } from "react-leaflet";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 
-// Fix para ícones do Leaflet no Vite
 delete L.Icon.Default.prototype._getIconUrl;
 L.Icon.Default.mergeOptions({
     iconRetinaUrl:
@@ -14,418 +13,253 @@ L.Icon.Default.mergeOptions({
         "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-shadow.png",
 });
 
-// Cache para ícones pre-gerados (otimização de performance)
 const iconCache = new Map();
+const MAX_MARKERS = 150;
 
-// Ícone customizado para aviões com diferentes cores por altitude (memoizado)
-const createAirplaneIcon = (rotation = 0, altitude = 0, onGround = false) => {
-    const cacheKey = `${Math.round(rotation / 10) * 10}-${altitude > 12000 ? "high" : altitude > 6000 ? "mid" : altitude > 0 ? "low" : "ground"}-${onGround}`;
+// Color by altitude range (matches a rainbow gradient like the reference)
+function altitudeColor(altitude, onGround) {
+    if (onGround) return "#64748b"; // slate for grounded
+    if (!altitude || altitude <= 0) return "#64748b";
+    if (altitude < 3000) return "#f97316"; // orange — low
+    if (altitude < 6000) return "#eab308"; // yellow
+    if (altitude < 9000) return "#22c55e"; // green
+    if (altitude < 12000) return "#06b6d4"; // cyan
+    return "#a855f7"; // purple — very high
+}
 
-    if (iconCache.has(cacheKey)) {
-        return iconCache.get(cacheKey);
-    }
+const createAirplaneIcon = (
+    rotation = 0,
+    altitude = 0,
+    onGround = false,
+    selected = false,
+) => {
+    const colorKey = onGround
+        ? "g"
+        : altitude > 12000
+          ? "p"
+          : altitude > 9000
+            ? "c"
+            : altitude > 6000
+              ? "gr"
+              : altitude > 3000
+                ? "y"
+                : "o";
+    const cacheKey = `${Math.round(rotation / 15) * 15}-${colorKey}-${selected ? "s" : "n"}`;
 
-    let color = "#2563eb"; // azul padrão
-    let shadow = "0 0 10px rgba(37, 99, 235, 0.5)";
+    if (iconCache.has(cacheKey)) return iconCache.get(cacheKey);
 
-    if (onGround) {
-        color = "#6b7280"; // cinza para no solo
-        shadow = "0 0 8px rgba(107, 114, 128, 0.3)";
-    } else if (altitude > 12000) {
-        color = "#ef4444"; // vermelho para alta altitude
-        shadow = "0 0 12px rgba(239, 68, 68, 0.6)";
-    } else if (altitude > 6000) {
-        color = "#f59e0b"; // amarelo para média altitude
-        shadow = "0 0 10px rgba(245, 158, 11, 0.5)";
-    } else if (altitude > 0) {
-        color = "#22c55e"; // verde para baixa altitude
-        shadow = "0 0 10px rgba(34, 197, 94, 0.5)";
-    }
+    const color = altitudeColor(altitude, onGround);
+    const size = selected ? 16 : 11;
+    const glow = selected ? `filter: drop-shadow(0 0 4px ${color});` : "";
 
     const icon = L.divIcon({
-        className: "custom-airplane-icon",
-        html: `
-      <div style="
-        transform: rotate(${rotation}deg);
-        font-size: 18px;
-        color: ${color};
-        filter: drop-shadow(${shadow});
-        transition: all 0.3s ease;
-      ">
-        ${onGround ? "🛬" : "✈️"}
-      </div>
-    `,
-        iconSize: [20, 20],
-        iconAnchor: [10, 10],
+        className: "aircraft-icon",
+        html: `<svg width="${size}" height="${size}" viewBox="0 0 16 16" style="transform: rotate(${rotation}deg); ${glow}">
+            <path fill="${color}" d="M8 1L7 5H3L4 7H7L8 15L9 7H12L13 5H9L8 1Z"/>
+        </svg>`,
+        iconSize: [size, size],
+        iconAnchor: [size / 2, size / 2],
     });
 
     iconCache.set(cacheKey, icon);
     return icon;
 };
 
-// Componente otimizado para atualizar o mapa quando os voos mudam
-function MapUpdater({ flights, realtime }) {
+// MapUpdater: fitBounds only once on first load; pan on selected flight
+const MapUpdater = memo(({ flights, selectedFlight }) => {
     const map = useMap();
-
-    const validFlights = useMemo(
-        () =>
-            flights.filter(
-                (flight) =>
-                    flight.latitude &&
-                    flight.longitude &&
-                    !isNaN(flight.latitude) &&
-                    !isNaN(flight.longitude),
-            ),
-        [flights],
-    );
+    const initializedRef = useRef(false);
 
     useEffect(() => {
-        if (validFlights.length > 0) {
-            const group = new L.featureGroup(
-                validFlights.map((flight) =>
-                    L.marker([flight.latitude, flight.longitude]),
-                ),
+        if (selectedFlight?.latitude && selectedFlight?.longitude) {
+            map.setView(
+                [selectedFlight.latitude, selectedFlight.longitude],
+                7,
+                { animate: true },
             );
-
-            map.fitBounds(group.getBounds(), {
-                padding: [50, 50],
-                maxZoom: realtime ? 6 : 4,
-            });
+            return;
         }
-    }, [validFlights, map, realtime]);
+        // Only auto-fit on the very first batch of data
+        if (!initializedRef.current && flights.length > 0) {
+            initializedRef.current = true;
+            const sample = flights.slice(0, 5);
+            const group = new L.featureGroup(
+                sample.map((f) => L.marker([f.latitude, f.longitude])),
+            );
+            map.fitBounds(group.getBounds(), { padding: [30, 30], maxZoom: 4 });
+        }
+    }, [flights, map, selectedFlight]);
 
     return null;
-}
+});
 
-const MemoizedMapUpdater = memo(MapUpdater);
+// ─── Memoised marker — only re-renders when position / altitude / selection changes
+const FlightMarker = memo(
+    function FlightMarker({ flight, isSelected, onSelectFlight }) {
+        const handleClick = useCallback(
+            () => onSelectFlight(flight),
+            [flight, onSelectFlight],
+        );
+
+        return (
+            <Marker
+                position={[flight.latitude, flight.longitude]}
+                icon={createAirplaneIcon(
+                    flight.true_track || 0,
+                    flight.baro_altitude || 0,
+                    flight.on_ground,
+                    isSelected,
+                )}
+                eventHandlers={
+                    onSelectFlight ? { click: handleClick } : undefined
+                }
+            >
+                <Popup className="sky-popup">
+                    <div className="bg-slate-900 border border-slate-600 rounded p-2 min-w-[180px] text-xs text-slate-200">
+                        <div className="font-semibold text-sky-400 mb-1.5 text-sm">
+                            {flight.callsign?.trim() || flight.icao24}
+                        </div>
+                        <div className="space-y-0.5 text-slate-300">
+                            <div className="flex justify-between gap-4">
+                                <span className="text-slate-500">Country</span>
+                                <span>{flight.origin_country || "—"}</span>
+                            </div>
+                            {!flight.on_ground && flight.baro_altitude && (
+                                <div className="flex justify-between gap-4">
+                                    <span className="text-slate-500">
+                                        Altitude
+                                    </span>
+                                    <span>
+                                        {Math.round(
+                                            flight.baro_altitude * 3.28084,
+                                        ).toLocaleString()}{" "}
+                                        ft
+                                    </span>
+                                </div>
+                            )}
+                            {flight.speed_kmh && (
+                                <div className="flex justify-between gap-4">
+                                    <span className="text-slate-500">
+                                        Speed
+                                    </span>
+                                    <span>
+                                        {Math.round(flight.speed_kmh / 1.852)}{" "}
+                                        kt
+                                    </span>
+                                </div>
+                            )}
+                            {flight.true_track != null && (
+                                <div className="flex justify-between gap-4">
+                                    <span className="text-slate-500">
+                                        Track
+                                    </span>
+                                    <span>
+                                        {Math.round(flight.true_track)}°
+                                    </span>
+                                </div>
+                            )}
+                            <div className="text-slate-600 pt-1 border-t border-slate-700 mt-1">
+                                {flight.icao24} ·{" "}
+                                {flight.on_ground ? "On ground" : "Airborne"}
+                            </div>
+                        </div>
+                    </div>
+                </Popup>
+            </Marker>
+        );
+    },
+    (prev, next) =>
+        prev.isSelected === next.isSelected &&
+        prev.flight.latitude === next.flight.latitude &&
+        prev.flight.longitude === next.flight.longitude &&
+        prev.flight.true_track === next.flight.true_track &&
+        prev.flight.baro_altitude === next.flight.baro_altitude,
+);
 
 const FlightMap = memo(function FlightMap({
     flights = [],
     refreshing = false,
-    realtime = false,
+    selectedFlight = null,
+    onSelectFlight = null,
 }) {
-    const [expandedFlight, setExpandedFlight] = useState(null);
-
-    // Centro padrão (mais focado na Europa/Atlântico para melhor visualização)
-    const defaultCenter = [45, 0];
-    const defaultZoom = realtime ? 3 : 2;
-
-    // Memoização dos voos válidos (otimização crítica)
-    const validFlights = useMemo(
-        () =>
-            flights.filter(
-                (flight) =>
-                    flight.latitude &&
-                    flight.longitude &&
-                    typeof flight.latitude === "number" &&
-                    typeof flight.longitude === "number" &&
-                    !isNaN(flight.latitude) &&
-                    !isNaN(flight.longitude),
-            ),
-        [flights],
-    );
-
-    // Memoização das estatísticas do mapa
-    const mapStats = useMemo(() => {
-        const airborne = validFlights.filter((f) => !f.on_ground);
-        const grounded = validFlights.filter((f) => f.on_ground);
-
-        return {
-            total: validFlights.length,
-            airborne: airborne.length,
-            grounded: grounded.length,
-            highAltitude: airborne.filter((f) => (f.baro_altitude || 0) > 12000)
-                .length,
-            countries: [...new Set(validFlights.map((f) => f.origin_country))]
-                .length,
-        };
-    }, [validFlights]);
-
-    // Formatação de dados de voo melhorada e memoizada
-    const formatFlightData = useCallback((flight) => {
-        const altitude = flight.baro_altitude || flight.geo_altitude || 0;
-        const speed =
-            flight.speed_kmh || (flight.velocity ? flight.velocity * 3.6 : 0);
-        const lastContact = flight.last_contact
-            ? new Date(flight.last_contact)
-            : null;
-
-        return {
-            ...flight,
-            altitude: Math.round(altitude),
-            speed: Math.round(speed),
-            lastContact,
-            isRecent: lastContact
-                ? Date.now() - lastContact.getTime() < 300000
-                : false,
-        };
-    }, []);
-
-    // Callback para toggle do flight expandido
-    const handleFlightClick = useCallback((icao24) => {
-        setExpandedFlight((prev) => (prev === icao24 ? null : icao24));
-    }, []);
+    const validFlights = useMemo(() => {
+        return flights
+            .filter(
+                (f) =>
+                    f.latitude &&
+                    f.longitude &&
+                    !isNaN(f.latitude) &&
+                    !isNaN(f.longitude),
+            )
+            .slice(0, MAX_MARKERS);
+    }, [flights]);
 
     return (
-        <div className="relative">
-            {/* Loading indicator aprimorado com glassmorphism */}
+        <div className="relative w-full h-full">
+            {/* Live badge */}
             {refreshing && (
-                <div
-                    className="absolute top-4 right-4 z-[1000]
-                    bg-white/20 backdrop-blur-md border border-white/30
-                    rounded-2xl shadow-2xl px-6 py-4 flex items-center space-x-4
-                    animate-pulse"
-                >
-                    <div className="flex-shrink-0">
-                        <div className="w-6 h-6 relative">
-                            <div className="absolute inset-0 rounded-full border-2 border-blue-400/30"></div>
-                            <div className="absolute inset-0 rounded-full border-2 border-blue-500 border-t-transparent animate-spin"></div>
-                        </div>
-                    </div>
-                    <div>
-                        <div className="text-sm font-semibold text-white drop-shadow-lg">
-                            {realtime ? "Dados ao vivo" : "Carregando..."}
-                        </div>
-                        <div className="text-xs text-white/80">
-                            {realtime ? "OpenSky Network" : "Cache local"}
-                        </div>
-                    </div>
+                <div className="absolute top-3 right-3 z-[1000] bg-slate-900/90 border border-slate-600 rounded px-2.5 py-1.5 flex items-center gap-1.5 text-xs text-slate-300">
+                    <div className="w-2 h-2 border border-slate-400 border-t-sky-400 rounded-full animate-spin"></div>
+                    Updating…
                 </div>
             )}
 
-            {/* Estatísticas do mapa com design moderno */}
-            <div
-                className="absolute top-4 left-4 z-[1000]
-                bg-gradient-to-br from-blue-500/20 to-purple-600/20
-                backdrop-blur-lg border border-white/20
-                rounded-2xl shadow-xl px-6 py-4 space-y-3"
-            >
-                <div className="flex items-center space-x-3">
-                    <div
-                        className="w-10 h-10 bg-gradient-to-r from-blue-500 to-purple-600
-                        rounded-full flex items-center justify-center"
-                    >
-                        <span className="text-white font-bold text-lg">✈</span>
-                    </div>
-                    <div>
-                        <div className="text-lg font-bold text-white drop-shadow-md">
-                            {mapStats.total}
-                        </div>
-                        <div className="text-xs text-white/80">voos ativos</div>
-                    </div>
+            {/* Altitude legend */}
+            <div className="absolute bottom-8 left-3 z-[1000] bg-slate-900/85 border border-slate-700 rounded px-3 py-2 text-xs text-slate-300">
+                <div className="flex items-center gap-1 mb-1">
+                    <span className="text-slate-400 text-[10px] uppercase tracking-wide">
+                        Altitude (ft)
+                    </span>
                 </div>
-
-                <div className="flex space-x-6 text-sm">
-                    <div className="flex items-center space-x-2">
-                        <div className="w-3 h-3 bg-green-400 rounded-full animate-pulse"></div>
-                        <span className="text-white/90">
-                            {mapStats.airborne}
-                        </span>
-                    </div>
-                    <div className="flex items-center space-x-2">
-                        <div className="w-3 h-3 bg-gray-400 rounded-full"></div>
-                        <span className="text-white/90">
-                            {mapStats.grounded}
-                        </span>
-                    </div>
-                </div>
-
-                <div className="text-xs text-white/70 border-t border-white/20 pt-2">
-                    {mapStats.countries} países • {mapStats.highAltitude} alta
-                    altitude
-                </div>
-            </div>
-
-            {/* Legenda moderna com animações */}
-            {realtime && (
-                <div
-                    className="absolute bottom-4 left-4 z-[1000]
-                    bg-gradient-to-br from-gray-800/30 to-gray-900/30
-                    backdrop-blur-md border border-white/20
-                    rounded-2xl shadow-lg px-5 py-4"
-                >
-                    <div className="text-sm font-semibold text-white mb-3 flex items-center space-x-2">
-                        <div className="w-2 h-2 bg-cyan-400 rounded-full animate-ping"></div>
-                        <span>Altitude</span>
-                    </div>
-                    <div className="space-y-2 text-xs">
-                        <div className="flex items-center space-x-3 group hover:bg-white/10 px-2 py-1 rounded-lg transition-all">
-                            <span className="text-red-400 text-base">✈️</span>
-                            <span className="text-white/90">&gt; 12km</span>
-                            <span className="text-red-300">(alta)</span>
-                        </div>
-                        <div className="flex items-center space-x-3 group hover:bg-white/10 px-2 py-1 rounded-lg transition-all">
-                            <span className="text-yellow-400 text-base">
-                                ✈️
+                <div className="flex items-center gap-1.5">
+                    {[
+                        { color: "#f97316", label: "0" },
+                        { color: "#eab308", label: "10k" },
+                        { color: "#22c55e", label: "20k" },
+                        { color: "#06b6d4", label: "30k" },
+                        { color: "#a855f7", label: "40k+" },
+                    ].map(({ color, label }) => (
+                        <span key={label} className="flex items-center gap-0.5">
+                            <span style={{ color }} className="text-[10px]">
+                                ■
                             </span>
-                            <span className="text-white/90">6-12km</span>
-                            <span className="text-yellow-300">(média)</span>
-                        </div>
-                        <div className="flex items-center space-x-3 group hover:bg-white/10 px-2 py-1 rounded-lg transition-all">
-                            <span className="text-green-400 text-base">✈️</span>
-                            <span className="text-white/90">&lt; 6km</span>
-                            <span className="text-green-300">(baixa)</span>
-                        </div>
-                        <div className="flex items-center space-x-3 group hover:bg-white/10 px-2 py-1 rounded-lg transition-all">
-                            <span className="text-gray-400 text-base">🛬</span>
-                            <span className="text-white/90">solo</span>
-                        </div>
-                    </div>
+                            <span className="text-[10px] text-slate-400">
+                                {label}
+                            </span>
+                        </span>
+                    ))}
                 </div>
-            )}
-
-            {/* Map com bordas arredondadas e sombra moderna */}
-            <div className="h-[600px] rounded-3xl overflow-hidden shadow-2xl ring-1 ring-white/20">
-                <MapContainer
-                    center={defaultCenter}
-                    zoom={defaultZoom}
-                    style={{ height: "100%", width: "100%" }}
-                    className="z-10"
-                >
-                    <TileLayer
-                        attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
-                        url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-                    />
-
-                    <MemoizedMapUpdater
-                        flights={validFlights}
-                        realtime={realtime}
-                    />
-
-                    {validFlights.map((flight, index) => {
-                        const formattedFlight = formatFlightData(flight);
-                        const position = [
-                            formattedFlight.latitude,
-                            formattedFlight.longitude,
-                        ];
-                        const heading = formattedFlight.true_track || 0;
-                        const altitude = formattedFlight.baro_altitude || 0;
-
-                        return (
-                            <Marker
-                                key={`${flight.icao24}-${index}`}
-                                position={position}
-                                icon={createAirplaneIcon(
-                                    heading,
-                                    altitude,
-                                    flight.on_ground,
-                                )}
-                                eventHandlers={{
-                                    click: () =>
-                                        handleFlightClick(flight.icao24),
-                                }}
-                            >
-                                <Popup className="modern-popup">
-                                    <div className="min-w-[280px] max-w-[320px] bg-gradient-to-br from-slate-800 to-slate-900 text-white rounded-2xl p-5 shadow-xl">
-                                        <div className="flex items-center justify-between mb-4">
-                                            <div className="flex items-center space-x-3">
-                                                <div className="w-12 h-12 bg-gradient-to-r from-blue-500 to-purple-600 rounded-full flex items-center justify-center text-xl">
-                                                    {formattedFlight.on_ground
-                                                        ? "🛬"
-                                                        : "✈️"}
-                                                </div>
-                                                <div>
-                                                    <div className="font-bold text-lg">
-                                                        {formattedFlight.callsign?.trim() ||
-                                                            "Voo anônimo"}
-                                                    </div>
-                                                    <div className="text-sm text-gray-300">
-                                                        {
-                                                            formattedFlight.origin_country
-                                                        }
-                                                    </div>
-                                                </div>
-                                            </div>
-                                            {formattedFlight.isRecent && (
-                                                <div className="bg-green-500/20 border border-green-500 text-green-300 text-xs px-3 py-1 rounded-full flex items-center space-x-1">
-                                                    <div className="w-2 h-2 bg-green-400 rounded-full animate-pulse"></div>
-                                                    <span>AO VIVO</span>
-                                                </div>
-                                            )}
-                                        </div>
-
-                                        <div className="space-y-4">
-                                            {!formattedFlight.on_ground && (
-                                                <div className="grid grid-cols-2 gap-4">
-                                                    <div className="bg-white/10 rounded-xl p-3">
-                                                        <label className="text-xs text-gray-400 uppercase tracking-wider">
-                                                            Altitude
-                                                        </label>
-                                                        <div className="text-lg font-bold">
-                                                            {formattedFlight.altitude
-                                                                ? `${formattedFlight.altitude.toLocaleString()}m`
-                                                                : "N/A"}
-                                                        </div>
-                                                    </div>
-                                                    <div className="bg-white/10 rounded-xl p-3">
-                                                        <label className="text-xs text-gray-400 uppercase tracking-wider">
-                                                            Velocidade
-                                                        </label>
-                                                        <div className="text-lg font-bold">
-                                                            {formattedFlight.speed
-                                                                ? `${formattedFlight.speed}km/h`
-                                                                : "N/A"}
-                                                        </div>
-                                                    </div>
-                                                </div>
-                                            )}
-
-                                            <div className="bg-white/5 rounded-xl p-3">
-                                                <label className="text-xs text-gray-400 uppercase tracking-wider">
-                                                    ICAO24
-                                                </label>
-                                                <div className="font-mono text-sm text-blue-300">
-                                                    {formattedFlight.icao24}
-                                                </div>
-                                            </div>
-
-                                            <div className="bg-white/5 rounded-xl p-3">
-                                                <label className="text-xs text-gray-400 uppercase tracking-wider">
-                                                    Coordenadas
-                                                </label>
-                                                <div className="text-sm font-mono text-gray-300">
-                                                    {formattedFlight.latitude.toFixed(
-                                                        4,
-                                                    )}
-                                                    °,{" "}
-                                                    {formattedFlight.longitude.toFixed(
-                                                        4,
-                                                    )}
-                                                    °
-                                                </div>
-                                            </div>
-
-                                            {formattedFlight.lastContact && (
-                                                <div className="text-xs text-gray-400 pt-3 border-t border-white/20">
-                                                    <div className="flex items-center justify-between">
-                                                        <span>
-                                                            Último contato:
-                                                        </span>
-                                                        <span>
-                                                            {formattedFlight.lastContact.toLocaleTimeString(
-                                                                "pt-BR",
-                                                            )}
-                                                        </span>
-                                                    </div>
-                                                    {realtime && (
-                                                        <div className="text-green-400 mt-1 flex items-center space-x-1">
-                                                            <div className="w-1 h-1 bg-green-400 rounded-full animate-pulse"></div>
-                                                            <span>
-                                                                Dados em tempo
-                                                                real
-                                                            </span>
-                                                        </div>
-                                                    )}
-                                                </div>
-                                            )}
-                                        </div>
-                                    </div>
-                                </Popup>
-                            </Marker>
-                        );
-                    })}
-                </MapContainer>
             </div>
+
+            {/* Map — dark tile */}
+            <MapContainer
+                center={[30, 10]}
+                zoom={3}
+                style={{ height: "100%", width: "100%", background: "#0f172a" }}
+                zoomControl={true}
+                attributionControl={false}
+            >
+                {/* Dark map tile — CartoDB Dark Matter */}
+                <TileLayer
+                    url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
+                    attribution='&copy; <a href="https://carto.com/">CARTO</a>'
+                    maxZoom={19}
+                />
+
+                <MapUpdater
+                    flights={validFlights}
+                    selectedFlight={selectedFlight}
+                />
+
+                {validFlights.map((flight, index) => (
+                    <FlightMarker
+                        key={`${flight.icao24}-${index}`}
+                        flight={flight}
+                        isSelected={selectedFlight?.icao24 === flight.icao24}
+                        onSelectFlight={onSelectFlight}
+                    />
+                ))}
+            </MapContainer>
         </div>
     );
 });
