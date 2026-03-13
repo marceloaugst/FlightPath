@@ -1,0 +1,69 @@
+groups:
+  - name: opensky_flight_alerts
+    interval: 30s # Avaliar regras a cada 30 s (intervalo de scrape)
+    rules:
+      # ── 1. Aeronave entrou na área monitorada ──────────────────────────────
+      - alert: FlightEnteredArea
+        expr: increase(opensky_area_entries_total[2m]) > 0
+        labels:
+          severity: info
+          category: area_entry
+        annotations:
+          summary: "Nova(s) aeronave(s) detectada(s) na área monitorada"
+          description: |
+            {{ $value | printf "%.0f" }} aeronave(s) nova(s) entraram na área
+            monitorada nos últimos 2 minutos.
+            Acesse o dashboard: http://localhost:8000
+
+      # ── 2. Aeronave em altitude baixa (< 1 000 m / ~3 300 ft) ─────────────
+      - alert: FlightLowAltitude
+        expr: opensky_flight_altitude_meters < 1000
+        for: 30s # Manter condição por 30 s antes de disparar
+        labels:
+          severity: warning
+          category: low_altitude
+        annotations:
+          summary: "Aeronave {{ $labels.callsign }} em altitude baixa"
+          description: |
+            Aeronave {{ $labels.callsign }} (ICAO24: {{ $labels.icao24 }},
+            origem: {{ $labels.country }}) está em {{ $value | printf "%.0f" }} m
+            de altitude (abaixo do limiar de 1 000 m).
+
+      # ── 3. Aeronave desapareceu do radar ──────────────────────────────────
+      - alert: FlightDisappearedFromRadar
+        expr: increase(opensky_disappeared_total[2m]) > 0
+        labels:
+          severity: warning
+          category: disappeared
+        annotations:
+          summary: "Aeronave(s) desapareceu do radar"
+          description: |
+            {{ $value | printf "%.0f" }} aeronave(s) que estavam sendo rastreadas
+            deixaram de aparecer nos dados nos últimos 2 minutos.
+
+      # ── 4. Nenhum dado recebido (dead-man switch) ─────────────────────────
+      - alert: OpenSkyDataStaleness
+        expr: (time() - opensky_last_update_timestamp) > 300
+        for: 1m
+        labels:
+          severity: critical
+          category: data_quality
+        annotations:
+          summary: "Dados do OpenSky estão desatualizados"
+          description: |
+            A última atualização de voos foi há mais de 5 minutos.
+            Verifique a fila de jobs (php artisan queue:work) e a conectividade
+            com a API OpenSky Network.
+
+      # ── 5. Nenhum voo em voo (anomalia de dados) ──────────────────────────
+      - alert: OpenSkyNoAirborneFlights
+        expr: opensky_flights_airborne == 0
+        for: 5m
+        labels:
+          severity: warning
+          category: data_quality
+        annotations:
+          summary: "Nenhuma aeronave em voo detectada"
+          description: |
+            Há mais de 5 minutos não há aeronaves em voo nos dados. Possível
+            problema na coleta de dados ou período de baixo tráfego.

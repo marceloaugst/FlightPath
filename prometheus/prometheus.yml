@@ -1,0 +1,52 @@
+# ── prometheus.yml — Configuração de exemplo para o projeto OpenSky ──────────
+#
+# Uso:
+#   1. Instale o Prometheus: https://prometheus.io/download/
+#   2. Coloque este arquivo em <prometheus_dir>/prometheus.yml
+#   3. Inicie: ./prometheus --config.file=prometheus.yml
+#   4. Acesse: http://localhost:9090
+#
+# Pré-requisitos:
+#   - Aplicação Laravel rodando (php artisan serve)
+#   - Rota GET /metrics exposta (adicionada em routes/web.php)
+#
+# Recomendação de segurança:
+#   Em produção, proteja /metrics com IP allowlist no nginx/caddy para que
+#   apenas o servidor Prometheus consiga acessar o endpoint.
+
+global:
+  scrape_interval: 30s # Intervalo de coleta (alinhar com cache_duration)
+  evaluation_interval: 30s # Intervalo de avaliação das regras de alerta
+  scrape_timeout: 10s
+
+# ── Regras de alerta ──────────────────────────────────────────────────────────
+rule_files:
+  - "alerts.yml" # Caminho relativo ao prometheus.yml
+
+# ── Alertmanager (opcional) ───────────────────────────────────────────────────
+# Descomente e configure para receber notificações por e-mail, Slack, PagerDuty
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets:
+#           - alertmanager:9093
+
+# ── Scrape targets ────────────────────────────────────────────────────────────
+scrape_configs:
+  # Aplicação Laravel — endpoint /metrics
+  - job_name: "opensky-laravel"
+    static_configs:
+      - targets:
+          - "localhost:8000" # Ajuste para o host/porta do seu servidor
+    metrics_path: "/metrics"
+    scheme: "http"
+    # Em produção com HTTPS:
+    # scheme: "https"
+    # tls_config:
+    #   insecure_skip_verify: false
+
+  # Auto-monitoramento do próprio Prometheus
+  - job_name: "prometheus"
+    static_configs:
+      - targets:
+          - "localhost:9090"

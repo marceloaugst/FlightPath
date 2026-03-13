@@ -14,7 +14,7 @@ L.Icon.Default.mergeOptions({
 });
 
 const iconCache = new Map();
-const MAX_MARKERS = 150;
+const MAX_MARKERS = 500;
 
 // Color by altitude range (matches a rainbow gradient like the reference)
 function altitudeColor(altitude, onGround) {

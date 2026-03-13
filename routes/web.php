@@ -48,3 +48,9 @@ Route::prefix('api')->name('api.')->group(function () {
 
 // Rotas legadas (compatibilidade)
 Route::get('/flights', [FlightController::class, 'index']);
+
+// ── Endpoint Prometheus ───────────────────────────────────────────────────────
+// Configure o Prometheus para fazer scrape GET /metrics
+// Recomendação: proteger com IP allowlist no nível do servidor (nginx/caddy)
+Route::get('/metrics', [\App\Http\Controllers\MetricsController::class, 'index'])
+    ->name('metrics');

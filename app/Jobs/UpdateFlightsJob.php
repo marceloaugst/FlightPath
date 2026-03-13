@@ -46,6 +46,9 @@ class UpdateFlightsJob implements ShouldQueue
          $processedFlights = $this->processFlightData($flightsData);
          $stats = $this->calculateStats($processedFlights);
 
+         // ── Contadores Prometheus: entradas em área e desaparecimentos ────
+         $this->updatePrometheusCounters($processedFlights);
+
          // Cache final data
          Cache::put('flights_data', $processedFlights, now()->addMinutes(5));
          Cache::put('flights_stats', $stats, now()->addMinutes(5));
@@ -74,7 +77,7 @@ class UpdateFlightsJob implements ShouldQueue
    private function processFlightData(array $flightsData): array
    {
       $processed = [];
-      $maxFlights = 150; // Increased for performance testing
+      $maxFlights = 500; // Increased for stress testing
 
       if (isset($flightsData['states']) && is_array($flightsData['states'])) {
          $count = 0;
@@ -117,6 +120,34 @@ class UpdateFlightsJob implements ShouldQueue
       }
 
       return $processed;
+   }
+
+   /**
+    * Atualiza contadores Prometheus comparando conjunto anterior com o atual.
+    * Registra novas entradas em área e aeronaves que desapareceram do radar.
+    */
+   private function updatePrometheusCounters(array $currentFlights): void
+   {
+      $currentIcao24  = array_column($currentFlights, 'icao24');
+      $previousIcao24 = Cache::get('prometheus_known_icao24', []);
+
+      if (!empty($previousIcao24)) {
+         // Novas aeronaves (entradas em área)
+         $newEntries = array_diff($currentIcao24, $previousIcao24);
+         if (!empty($newEntries)) {
+            $prev = (int) Cache::get('prometheus_area_entries', 0);
+            Cache::put('prometheus_area_entries', $prev + count($newEntries), now()->addDays(30));
+         }
+
+         // Aeronaves que sumiram (desaparecidas)
+         $gone = array_diff($previousIcao24, $currentIcao24);
+         if (!empty($gone)) {
+            $prev = (int) Cache::get('prometheus_disappeared', 0);
+            Cache::put('prometheus_disappeared', $prev + count($gone), now()->addDays(30));
+         }
+      }
+
+      Cache::put('prometheus_known_icao24', $currentIcao24, now()->addMinutes(10));
    }
 
    /**

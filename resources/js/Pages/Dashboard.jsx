@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo, useCallback, useRef, memo } from "react";
 import Layout from "../Layouts/Layout";
 import FlightMap from "../Components/FlightMap";
+import AlertPanel from "../Components/AlertPanel";
 import { useWebSocket } from "../hooks/useWebSocket";
 
 // ─── Pure helpers (outside component → never re-created) ─────────────────────
@@ -287,25 +288,8 @@ export default function Dashboard({
                             </span>
                         </div>
 
-                        <label className="flex items-center gap-1.5 cursor-pointer text-xs text-slate-400">
-                            <input
-                                type="checkbox"
-                                checked={autoRefresh}
-                                onChange={(e) =>
-                                    setAutoRefresh(e.target.checked)
-                                }
-                                className="accent-sky-500 w-3 h-3"
-                            />
-                            Auto
-                        </label>
-
-                        <button
-                            onClick={() => refreshFlights()}
-                            disabled={isRefreshing}
-                            className="bg-sky-600 hover:bg-sky-500 disabled:opacity-40 text-white text-xs px-3 py-1.5 rounded transition-colors font-medium"
-                        >
-                            {isRefreshing ? "..." : "Refresh"}
-                        </button>
+                        {/* Painel de alertas Prometheus */}
+                        <AlertPanel flights={flights} />
 
                         <button
                             onClick={() => setShowSidebar((v) => !v)}
