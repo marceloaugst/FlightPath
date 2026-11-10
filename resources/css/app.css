@@ -41,6 +41,12 @@
     contain: layout style size;
 }
 
+/* Mapa escuro sem API: inverte as cores do tile OSM e ajusta brilho/contraste.
+   Aumente o brightness se ainda estiver escuro demais. */
+.leaflet-tile-pane .dark-tiles {
+    filter: invert(1) hue-rotate(180deg) brightness(1.1) contrast(0.9) saturate(0.8);
+}
+
 /* Dark popup for FlightPath */
 .leaflet-popup-content-wrapper {
     background: #0f172a !important;

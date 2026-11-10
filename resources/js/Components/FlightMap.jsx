@@ -239,10 +239,11 @@ const FlightMap = memo(function FlightMap({
                 zoomControl={true}
                 attributionControl={false}
             >
-                {/* Dark map tile — CartoDB Dark Matter */}
+                {/* Tile OpenStreetMap padrão, escurecido via filtro CSS (classe dark-tiles) */}
                 <TileLayer
-                    url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
-                    attribution='&copy; <a href="https://carto.com/">CARTO</a>'
+                    url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                    attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+                    className="dark-tiles"
                     maxZoom={19}
                 />
 
